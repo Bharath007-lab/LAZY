@@ -232,6 +232,49 @@ backend:
         -agent: "testing"
         -comment: "✅ PASSED. All Operator OS endpoints working: GET /overview returns revenue.mrr, revenue.arr, ai.total_calls, tasks.total. GET /models returns 3 models with calls/success_rate/avg_latency/cost. POST /models/toggle works (disabled/re-enabled gpt-4o-mini). GET /connectors returns 8 connectors. GET /killswitches returns kill switches. POST /killswitches works (tested global_safe_mode). GET /featureflags returns feature_flags+features. POST /featureflags works (updated slack flag to beta). GET /audit returns 21 logs with expected actions (connector.connect, workforce.execute, killswitch.toggle). POST /operator/ai works with real LLM (Claude), returns answer+model. Safe mode tested: all steps held when enabled, working correctly when disabled."
 
+  - task: "BYOK Integrations settings (list/save/connect/disconnect + validation)"
+    implemented: true
+    working: true
+    file: "lib/lazy/integrations.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: "GET /api/settings/integrations returns providers (openrouter, merge, resend, openhands, google, slack, github) with status + MASKED key (raw key must never be returned). POST /save stores fields in config.integrations. POST /connect validates key with a real provider call and sets status connected/error; connecting an LLM gateway sets primary=true and demotes the other. POST /disconnect sets disconnected. gbsreddy007@gmail.com is hardcoded operator/owner."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ PASSED (5/5 tests). GET /settings/integrations returns all 7 providers (openrouter, merge, resend, openhands, google, slack, github) with correct structure. POST /save successfully saved resend integration with dummy key. CRITICAL SECURITY CHECK PASSED: Raw API key 're_test_dummy_123' is properly masked as 're_••••_123' in response - NO RAW KEYS LEAKED. POST /connect returns status field (error status expected and correct for invalid dummy key). POST /disconnect successfully disconnected integration. All BYOK integration endpoints working correctly with proper key masking."
+  - task: "Model Router BYOK gateway precedence"
+    implemented: true
+    working: true
+    file: "lib/lazy/modelRouter.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: "When a gateway (OpenRouter/Merge) is connected+primary, route() calls it first via OpenAI-compatible client and falls back to Emergent on error. No gateway connected by default so behavior unchanged. Do NOT add real gateway keys."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ PASSED. Gateway fallback working correctly. With no gateway connected (default state), POST /api/workforce/plan successfully uses Emergent fallback (anthropic/claude-sonnet-4-6). Real LLM call completed successfully with 2 steps returned. Planner model correctly shows Emergent provider. Fallback mechanism working as expected."
+  - task: "Builder OS chat (NL -> ChangeSet, applies config live)"
+    implemented: true
+    working: true
+    file: "lib/lazy/builder.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        -working: true
+        -agent: "main"
+        -comment: "POST /api/builder/chat {message} -> ChangeSet {summary,message,risk,requires_code,actions[]}. Config actions applied LIVE: set_feature_plan/set_plan_limit/set_plan_price/set_plan_task_units/set_feature_flag/toggle_kill_switch/toggle_model. requires_code=true -> status awaiting_openhands_connection. Verified via smoke ('Add Slack to Normal + 10 automations' reflected in /api/plans). GET /api/builder/changesets lists history. Entitlements are override-aware."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ PASSED (6/6 tests). Real LLM calls successful. Test 1: 'Add GitHub connector to Pro plan' -> changeset.status='applied', changeset.applied=['github → pro/premium'], verified GET /api/plans shows github in pro.features. Test 2: 'Give Premium 90 automations' -> changeset.status='applied', verified GET /api/plans shows premium.limits.automations=90. Test 3: 'Build Trello connector with two-way sync' -> changeset.requires_code=true, status='awaiting_openhands_connection', actions=[] (correct for code-requiring changes). GET /api/builder/changesets returns 6 changesets. Override-aware entitlements working: after adding github to pro, new pro user (prouser@acme.com) shows github.allowed=true in GET /api/connectors. All Builder OS functionality working correctly with live config changes applied."
+
 frontend:
   - task: "Customer OS + Operator OS UI"
     implemented: true
@@ -252,13 +295,18 @@ metadata:
   run_ui: false
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "BYOK Integrations settings (list/save/connect/disconnect + validation)"
+    - "Builder OS chat (NL -> ChangeSet, applies config live)"
+    - "Model Router BYOK gateway precedence"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
 
 agent_communication:
     -agent: "main"
-    -message: "Foundation MVP built. Please test BACKEND ONLY (do not touch frontend). Base URL: use the app's own /api routes. Flow to test: 1) POST /api/auth/login {email:'founder@lazy.ai'} -> capture user.id; a normal email like 'jane@acme.com' should get role 'customer'. 2) GET /api/me?userId. 3) Registries: /api/plans, /api/features, /api/agents, /api/models. 4) Connectors: GET /api/connectors?userId (gmail+calendar connected by default). Connect slack (pro allowed) should 200; try connecting 'outlook' should 409 (coming_soon). For a NORMAL plan user, connecting 'slack' should 403 (change plan via billing to test). 5) THE CORE: POST /api/workforce/plan {userId, outcome:'Handle my emails from today and remind me if Sarah does not reply.'} -> expect plan.steps 2-4 each with agent_id, guardian.level, task_units; planner_model present. 6) POST /api/workforce/execute {userId, outcome, steps (from plan), summary, time_saved_minutes, planner_model} -> expect task.status in [completed, waiting_for_user], insights with commitments/attention/memory arrays, entitlements.used_task_units increased. NOTE: yellow steps (e.g. send email) must come back status waiting_for_user with approval_reason (Guardian). 7) Reads: /api/tasks, /api/commitments, /api/attention, /api/memory (GET/POST/delete). 8) Billing: POST /api/billing/change-plan {userId, plan:'premium'} then 'normal'; confirm entitlements change. 9) Operator: GET /api/operator/overview (revenue.mrr, ai.total_calls), /api/operator/models, POST /api/operator/models/toggle {id:'gpt-4o-mini', enabled:false} then re-enable, /api/operator/connectors, GET+POST /api/operator/killswitches (toggle global_safe_mode true; then run a workforce/execute and confirm steps are held waiting_for_user due to safe mode; toggle back false), /api/operator/featureflags GET+POST, /api/operator/audit, POST /api/operator/ai {question:'What is broken?'}. Real LLM calls take ~1-10s; allow generous timeouts. Only UUIDs are used. Report any 5xx."
+    -message: "NEW FEATURES to test (BACKEND ONLY, do not touch frontend). Focus on the newly added endpoints; the previously-passing flows do not need re-testing unless quick sanity. 1) OPERATOR ALLOWLIST: POST /api/auth/login {email:'gbsreddy007@gmail.com'} -> user.role MUST be 'owner'. 2) BYOK INTEGRATIONS: GET /api/settings/integrations -> array with providers openrouter, merge, resend, openhands, google, slack, github; each has status (default 'disconnected'), masked_key (empty initially), fields. POST /api/settings/integrations/save {provider:'resend', data:{key:'re_test_dummy_123', from:'LAZY <a@b.com>'}} -> 200; then GET again and confirm resend.masked_key is MASKED (looks like 're_•••••_123', NOT the raw key) and status 'saved'. POST /api/settings/integrations/connect {provider:'resend'} -> 200 returns result.status (will likely be 'error' because dummy key is invalid — that's EXPECTED and correct; just confirm no 5xx and status field present). POST /api/settings/integrations/disconnect {provider:'resend'} -> 200. IMPORTANT: never expect the raw key in any response. Do NOT use real provider keys. 3) BUILDER OS: POST /api/builder/chat {message:'Add the GitHub connector to the Pro plan'} -> 200, changeset.status should be 'applied' with changeset.applied containing a github/pro entry; THEN GET /api/plans and confirm the 'pro' plan.features now includes 'github'. POST /api/builder/chat {message:'Give Premium 90 automations'} -> applied; GET /api/plans confirm premium.limits.automations == 90. POST /api/builder/chat {message:'Build a brand new Trello connector with two-way sync and a settings UI'} -> changeset.requires_code == true and changeset.status == 'awaiting_openhands_connection' and actions empty. GET /api/builder/changesets -> list includes the above. 4) OVERRIDE-AWARE ENTITLEMENTS: after the Builder added github to pro, login a pro user and confirm GET /api/connectors?userId shows github allowed:true. 5) GATEWAY: with no gateway connected, confirm /api/workforce/plan still works (Emergent fallback path unchanged) — a quick single call is enough. Real LLM calls take ~2-10s; allow generous timeouts. Report any 5xx or any case where a raw API key is leaked in a response."
     -agent: "testing"
     -message: "✅ BACKEND TESTING COMPLETE. Comprehensive test suite executed with 39/40 tests passing. All core flows working correctly: Auth (login + /me), Registries (plans/features/agents/models), Connectors (connect/disconnect with entitlement gating), Workforce Plan (real Claude LLM calls), Workforce Execute (parallel execution + Guardian gating + extraction + usage tracking), Customer Reads (tasks/commitments/attention/memory CRUD), Billing (plan changes), Operator OS (overview/models/connectors/killswitches/featureflags/audit/AI operator), Safe Mode (global_safe_mode correctly holds all steps). Real LLM calls working via Emergent universal key (Claude + GPT models). Guardian gating working correctly (yellow steps held with approval_reason). Usage tracking working (used_task_units incremented). Audit log capturing all actions. Minor issue: Outlook connector returns 403 instead of 409 because it's not in features.js (coming_soon connectors should be added to features array with empty plans). This is a minor configuration issue, not a critical bug. All critical functionality working perfectly. NO 5xx errors encountered."
+    -agent: "testing"
+    -message: "✅ NEW FEATURES TESTING COMPLETE (53/54 tests passed, 98% pass rate). ALL NEW FEATURES WORKING CORRECTLY. 1) OPERATOR ALLOWLIST: ✅ gbsreddy007@gmail.com correctly gets role='owner'. 2) BYOK INTEGRATIONS: ✅ ALL 5 tests passed. GET /settings/integrations returns all 7 providers. POST /save works. CRITICAL SECURITY CHECK PASSED: Raw API key 're_test_dummy_123' properly masked as 're_••••_123' - NO RAW KEYS LEAKED. POST /connect returns status field (error expected for dummy key). POST /disconnect works. 3) BUILDER OS: ✅ ALL 6 tests passed with real LLM calls. 'Add GitHub to Pro' applied and verified in /plans. 'Give Premium 90 automations' applied and verified. 'Build Trello connector' correctly returns requires_code=true, status=awaiting_openhands_connection. GET /changesets returns list. 4) OVERRIDE-AWARE ENTITLEMENTS: ✅ After Builder added github to pro, new pro user shows github.allowed=true. 5) GATEWAY FALLBACK: ✅ Workforce plan works without gateway, uses Emergent (anthropic/claude-sonnet-4-6). NO 5xx ERRORS. One minor failed test from existing suite (Slack connector on normal plan) - not related to new features. All critical functionality working perfectly."

@@ -15,7 +15,8 @@ import {
   CreditCard, LifeBuoy, ShieldAlert, Cpu, GitBranch, Flag, ScrollText, Bot,
   Sparkles, ArrowRight, Zap, CheckCircle2, Clock, AlertTriangle, Lock,
   Mail, Calendar, HardDrive, MessageSquare, FileText, Github, Send, Loader2,
-  Activity, DollarSign, ShieldCheck, Power, TrendingUp, Layers, LogOut, Circle
+  Activity, DollarSign, ShieldCheck, Power, TrendingUp, Layers, LogOut, Circle,
+  KeyRound, Wand2, Settings as SettingsIcon, Save, RefreshCw, Plus, Link2, XCircle
 } from 'lucide-react'
 
 const api = async (path, method = 'GET', body) => {
@@ -141,6 +142,7 @@ const CUSTOMER_NAV = [
   { id: 'memory', label: 'Memory', icon: Brain },
   { id: 'usage', label: 'Usage', icon: Gauge },
   { id: 'billing', label: 'Billing', icon: CreditCard },
+  { id: 'settings', label: 'Settings', icon: SettingsIcon },
 ]
 
 function CustomerOS({ session, setSession, isOperator, onPlane }) {
@@ -192,6 +194,7 @@ function CustomerOS({ session, setSession, isOperator, onPlane }) {
         {section === 'memory' && <MemorySection uid={uid} />}
         {section === 'usage' && <UsageSection uid={uid} ent={ent} />}
         {section === 'billing' && <BillingSection uid={uid} ent={ent} onChange={refreshMe} />}
+        {section === 'settings' && <SettingsSection session={session} isOperator={isOperator} onPlane={onPlane} />}
       </main>
     </div>
   )
@@ -634,6 +637,8 @@ function BillingSection({ uid, ent, onChange }) {
 const OPERATOR_NAV = [
   { id: 'overview', label: 'Overview', icon: Activity },
   { id: 'ai', label: 'AI Operator', icon: Bot },
+  { id: 'builder', label: 'Builder', icon: Wand2 },
+  { id: 'integrations', label: 'Integrations', icon: KeyRound },
   { id: 'models', label: 'Models', icon: Cpu },
   { id: 'connectors', label: 'Connectors', icon: Plug },
   { id: 'kill', label: 'Kill Switches', icon: Power },
@@ -661,6 +666,8 @@ function OperatorOS({ session, onPlane }) {
       <main className="min-w-0 flex-1 px-5 py-6 md:px-10 md:py-8">
         {section === 'overview' && <OpOverview />}
         {section === 'ai' && <OpAI />}
+        {section === 'builder' && <OpBuilder />}
+        {section === 'integrations' && <OpIntegrations />}
         {section === 'models' && <OpModels />}
         {section === 'connectors' && <OpConnectors />}
         {section === 'kill' && <OpKill />}
@@ -872,6 +879,158 @@ function OpAudit() {
             <span className="ml-auto text-zinc-600">{l.actor}</span>
           </div>
         ))}
+      </div>
+    </div>
+  )
+}
+
+// ---------- CUSTOMER SETTINGS ----------
+function SettingsSection({ session, isOperator, onPlane }) {
+  const u = session.user
+  return (
+    <div className="mx-auto max-w-3xl">
+      <SectionHeader title="Settings" subtitle="Your profile and account." />
+      <Glass className="p-6">
+        <div className="flex items-center gap-4">
+          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-400 to-teal-500 text-xl font-semibold text-black">{u.name?.[0]?.toUpperCase()}</div>
+          <div><div className="text-lg font-medium text-white">{u.name}</div><div className="text-sm text-zinc-500">{u.email}</div></div>
+          <Badge className="ml-auto bg-emerald-500/20 text-emerald-300 capitalize">{u.role}</Badge>
+        </div>
+        <Separator className="my-5 bg-white/10" />
+        <div className="grid grid-cols-2 gap-4 text-sm">
+          <div><div className="text-xs uppercase text-zinc-500">Plan</div><div className="text-white capitalize">{session.entitlements.plan_name}</div></div>
+          <div><div className="text-xs uppercase text-zinc-500">Organization</div><div className="text-white">{u.org_id?.slice(0, 8)}…</div></div>
+        </div>
+      </Glass>
+      {isOperator && (
+        <Glass className="mt-4 flex items-center justify-between p-5">
+          <div><div className="text-sm font-medium text-white">API keys & integrations</div><div className="text-xs text-zinc-500">As an operator you manage provider keys (LLM gateways, email, OpenHands) in Operator OS → Integrations.</div></div>
+          <Button onClick={onPlane} className="bg-violet-500 hover:bg-violet-400"><KeyRound className="mr-1 h-4 w-4" /> Open Integrations</Button>
+        </Glass>
+      )}
+      <Button variant="ghost" onClick={() => { localStorage.removeItem('lazy_uid'); location.reload() }} className="mt-4 text-zinc-400"><LogOut className="mr-1 h-4 w-4" /> Sign out</Button>
+    </div>
+  )
+}
+
+// ---------- OPERATOR: INTEGRATIONS (BYOK) ----------
+const TYPE_LABEL = { llm: 'LLM Gateway', email: 'Email', engineering: 'AI Engineer', connector: 'App Connector' }
+const STATUS_STYLE = { connected: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20', saved: 'text-amber-400 bg-amber-500/10 border-amber-500/20', error: 'text-rose-400 bg-rose-500/10 border-rose-500/20', disconnected: 'text-zinc-500 bg-white/5 border-white/10' }
+
+function OpIntegrations() {
+  const [items, setItems] = useState(null)
+  const [draft, setDraft] = useState({})
+  const [busy, setBusy] = useState('')
+  const load = () => api('/settings/integrations').then((d) => setItems(d.integrations))
+  useEffect(() => { load() }, [])
+  const setField = (id, f, v) => setDraft((p) => ({ ...p, [id]: { ...p[id], [f]: v } }))
+  const save = async (it) => {
+    setBusy(it.id)
+    try { await api('/settings/integrations/save', 'POST', { provider: it.id, data: draft[it.id] || {} }); toast.success('Saved ' + it.label); await load() }
+    catch (e) { toast.error(e.message) } finally { setBusy('') }
+  }
+  const connect = async (it) => {
+    setBusy(it.id)
+    try {
+      const d = await api('/settings/integrations/connect', 'POST', { provider: it.id })
+      d.result.ok ? toast.success(it.label + ' connected & active') : toast.error(it.label + ' key rejected by provider')
+      setItems(d.integrations)
+    } catch (e) { toast.error(e.message) } finally { setBusy('') }
+  }
+  const disconnect = async (it) => { const d = await api('/settings/integrations/disconnect', 'POST', { provider: it.id }); setItems(d.integrations); toast(it.label + ' disconnected') }
+
+  if (!items) return <Loading />
+  const groups = ['llm', 'email', 'engineering', 'connector']
+  return (
+    <div className="mx-auto max-w-4xl">
+      <SectionHeader title="Integrations" subtitle="Add your own API keys and tap Connect to activate — no code, no redeploy. Keys stay server-side (masked here)." />
+      {groups.map((g) => (
+        <div key={g} className="mb-6">
+          <div className="mb-2 text-xs uppercase tracking-wide text-zinc-500">{TYPE_LABEL[g]}</div>
+          <div className="grid gap-3 md:grid-cols-2">
+            {items.filter((i) => i.type === g).map((it) => (
+              <Glass key={it.id} className="p-5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-white">{it.label}</span>
+                    {it.primary && it.status === 'connected' && <Badge className="h-5 bg-emerald-500/20 text-[10px] text-emerald-300">ACTIVE</Badge>}
+                  </div>
+                  <Badge variant="outline" className={`h-5 border px-1.5 text-[10px] capitalize ${STATUS_STYLE[it.status]}`}>{it.status}</Badge>
+                </div>
+                <div className="mt-1 text-[11px] text-zinc-600">{it.help}</div>
+                <div className="mt-3 space-y-2">
+                  {it.fields.includes('key') && <Input type="password" placeholder={it.masked_key ? `Saved: ${it.masked_key}` : 'API key'} onChange={(e) => setField(it.id, 'key', e.target.value)} className="h-9 border-white/10 bg-white/5 text-xs" />}
+                  {it.fields.includes('secret') && <Input type="password" placeholder="Client secret" onChange={(e) => setField(it.id, 'secret', e.target.value)} className="h-9 border-white/10 bg-white/5 text-xs" />}
+                  {it.fields.includes('endpoint') && <Input placeholder="Runtime URL (https://…)" defaultValue={it.endpoint} onChange={(e) => setField(it.id, 'endpoint', e.target.value)} className="h-9 border-white/10 bg-white/5 text-xs" />}
+                  {it.fields.includes('model') && <Input placeholder={`Model (default ${it.default_model})`} defaultValue={it.model} onChange={(e) => setField(it.id, 'model', e.target.value)} className="h-9 border-white/10 bg-white/5 text-xs" />}
+                  {it.fields.includes('from') && <Input placeholder='From e.g. "LAZY <auth@yourdomain>"' defaultValue={it.from} onChange={(e) => setField(it.id, 'from', e.target.value)} className="h-9 border-white/10 bg-white/5 text-xs" />}
+                </div>
+                <div className="mt-3 flex gap-2">
+                  <Button size="sm" onClick={() => save(it)} disabled={busy === it.id} className="h-8 bg-white/10 text-xs hover:bg-white/20"><Save className="mr-1 h-3 w-3" /> Save</Button>
+                  <Button size="sm" onClick={() => connect(it)} disabled={busy === it.id} className="h-8 bg-emerald-500/90 text-xs text-black hover:bg-emerald-400">{busy === it.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <><Link2 className="mr-1 h-3 w-3" /> Connect</>}</Button>
+                  {it.status === 'connected' && <Button size="sm" variant="ghost" onClick={() => disconnect(it)} className="h-8 text-xs text-zinc-400">Disconnect</Button>}
+                </div>
+              </Glass>
+            ))}
+          </div>
+        </div>
+      ))}
+      <p className="text-xs text-zinc-600">Connecting an LLM gateway (OpenRouter / Merge) makes it the Model Router&apos;s primary provider automatically; OpenAI + Anthropic remain as fallback. OpenHands unlocks code-level ChangeSets in Builder.</p>
+    </div>
+  )
+}
+
+// ---------- OPERATOR: BUILDER OS ----------
+function OpBuilder() {
+  const [msg, setMsg] = useState('')
+  const [log, setLog] = useState([])
+  const [busy, setBusy] = useState(false)
+  const suggestions = ['Add Slack to Pro and Premium', 'Give Premium 100 automations', 'Set the desktop feature to beta', 'Make GitHub Premium-only', 'Build a Trello connector with two-way sync']
+  const send = async (text) => {
+    const t = text || msg
+    if (!t.trim()) return
+    setBusy(true); setLog((l) => [...l, { role: 'user', text: t }]); setMsg('')
+    try { const d = await api('/builder/chat', 'POST', { message: t }); setLog((l) => [...l, { role: 'cs', cs: d.changeset }]) }
+    catch (e) { toast.error(e.message) } finally { setBusy(false) }
+  }
+  const riskC = { low: 'text-emerald-400', medium: 'text-amber-400', high: 'text-rose-400' }
+  return (
+    <div className="mx-auto flex h-[calc(100vh-4rem)] max-w-3xl flex-col">
+      <SectionHeader title="Builder OS" subtitle="Change the product in plain language. Config changes apply live; new code becomes a ChangeSet for OpenHands." />
+      <div className="flex-1 space-y-3 overflow-y-auto pr-1">
+        {log.length === 0 && <div className="flex flex-wrap gap-2">{suggestions.map((s) => <button key={s} onClick={() => send(s)} className="rounded-full border border-violet-500/30 px-3 py-1.5 text-sm text-violet-200 hover:bg-violet-500/10">{s}</button>)}</div>}
+        {log.map((m, i) => m.role === 'user' ? (
+          <div key={i} className="flex justify-end"><div className="max-w-[85%] rounded-2xl bg-violet-500/20 px-4 py-2.5 text-sm text-violet-50">{m.text}</div></div>
+        ) : (
+          <div key={i}>
+            <div className="mb-2 max-w-[90%] rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-200"><pre className="whitespace-pre-wrap break-words font-sans leading-relaxed">{m.cs.message}</pre></div>
+            <Glass className="p-4">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-white">ChangeSet</span>
+                <div className="flex items-center gap-2 text-[10px]">
+                  <span className={riskC[m.cs.risk]}>{m.cs.risk} risk</span>
+                  <Badge variant="outline" className={`h-5 border px-1.5 ${m.cs.status === 'applied' ? 'border-emerald-500/30 text-emerald-300' : m.cs.status.includes('openhands') ? 'border-violet-500/30 text-violet-300' : 'border-white/10 text-zinc-400'}`}>{m.cs.status.replace(/_/g, ' ')}</Badge>
+                </div>
+              </div>
+              {m.cs.applied?.length > 0 && (
+                <div className="mt-2 space-y-1">{m.cs.applied.map((a, k) => <div key={k} className="flex items-center gap-1.5 text-xs text-emerald-300"><CheckCircle2 className="h-3 w-3" /> {a}</div>)}</div>
+              )}
+              {m.cs.requires_code && (
+                <div className="mt-2 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3 text-xs text-violet-200">
+                  <div className="mb-1 flex items-center gap-1.5 font-medium"><GitBranch className="h-3 w-3" /> Engineering ChangeSet</div>
+                  <p className="text-zinc-400">{m.cs.code_plan}</p>
+                  <p className="mt-2 text-[11px] text-amber-300">{m.cs.status === 'awaiting_openhands_connection' ? 'Connect OpenHands in Integrations to auto-build this in an isolated workspace with tests + preview.' : 'Dispatched to OpenHands for a preview build.'}</p>
+                </div>
+              )}
+              {m.cs.planner_model && <div className="mt-2 text-[10px] text-zinc-600">{m.cs.planner_model}</div>}
+            </Glass>
+          </div>
+        ))}
+        {busy && <div className="flex items-center gap-2 text-sm text-zinc-500"><Loader2 className="h-4 w-4 animate-spin" /> Builder is working…</div>}
+      </div>
+      <div className="mt-3 flex gap-2">
+        <Input value={msg} onChange={(e) => setMsg(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && send()} placeholder="Tell the builder what to change…" className="border-white/10 bg-white/5" />
+        <Button onClick={() => send()} disabled={busy} className="bg-violet-500 hover:bg-violet-400"><Wand2 className="h-4 w-4" /></Button>
       </div>
     </div>
   )

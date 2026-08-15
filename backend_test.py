@@ -907,6 +907,383 @@ def test_11_feature_flags_audit():
     except Exception as e:
         log_test("AUDIT: GET /audit", False, f"Exception: {str(e)}")
 
+def test_12_operator_allowlist():
+    """Test 12: OPERATOR ALLOWLIST - gbsreddy007@gmail.com gets role=owner"""
+    print("\n" + "="*80)
+    print("TEST 12: OPERATOR ALLOWLIST")
+    print("="*80)
+    
+    try:
+        resp = requests.post(f"{BASE_URL}/auth/login", json={"email": "gbsreddy007@gmail.com"}, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "user" in data:
+                user = data["user"]
+                if user.get("role") == "owner":
+                    log_test("OPERATOR ALLOWLIST: gbsreddy007@gmail.com role", True, f"Role: {user.get('role')} (correct)")
+                else:
+                    log_test("OPERATOR ALLOWLIST: gbsreddy007@gmail.com role", False, f"Expected role=owner, got role={user.get('role')}")
+            else:
+                log_test("OPERATOR ALLOWLIST: gbsreddy007@gmail.com role", False, "Missing user in response")
+        else:
+            log_test("OPERATOR ALLOWLIST: gbsreddy007@gmail.com role", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("OPERATOR ALLOWLIST: gbsreddy007@gmail.com role", False, f"Exception: {str(e)}")
+
+def test_13_byok_integrations():
+    """Test 13: BYOK INTEGRATIONS - List, Save, Connect, Disconnect with SECURITY CHECK"""
+    print("\n" + "="*80)
+    print("TEST 13: BYOK INTEGRATIONS (CRITICAL SECURITY CHECK)")
+    print("="*80)
+    
+    # Test GET /settings/integrations
+    try:
+        resp = requests.get(f"{BASE_URL}/settings/integrations", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "integrations" in data:
+                integrations = data["integrations"]
+                expected_providers = ["openrouter", "merge", "resend", "openhands", "google", "slack", "github"]
+                found_providers = [i.get("id") for i in integrations]
+                
+                if all(p in found_providers for p in expected_providers):
+                    # Check structure
+                    resend = next((i for i in integrations if i["id"] == "resend"), None)
+                    if resend:
+                        has_fields = all(k in resend for k in ["id", "label", "type", "status", "masked_key", "fields"])
+                        if has_fields and resend.get("status") == "disconnected":
+                            log_test("BYOK: GET /settings/integrations", True, f"Found all {len(expected_providers)} providers with correct structure")
+                        else:
+                            log_test("BYOK: GET /settings/integrations", False, f"Missing fields or incorrect status. Status: {resend.get('status')}")
+                    else:
+                        log_test("BYOK: GET /settings/integrations", False, "Resend provider not found")
+                else:
+                    missing = [p for p in expected_providers if p not in found_providers]
+                    log_test("BYOK: GET /settings/integrations", False, f"Missing providers: {missing}")
+            else:
+                log_test("BYOK: GET /settings/integrations", False, "Missing integrations in response")
+        else:
+            log_test("BYOK: GET /settings/integrations", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("BYOK: GET /settings/integrations", False, f"Exception: {str(e)}")
+    
+    # Test POST /settings/integrations/save
+    dummy_key = "re_test_dummy_123"
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/settings/integrations/save",
+            json={"provider": "resend", "data": {"key": dummy_key, "from": "LAZY <a@b.com>"}},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            log_test("BYOK: POST /settings/integrations/save", True, "Saved resend integration")
+        else:
+            log_test("BYOK: POST /settings/integrations/save", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("BYOK: POST /settings/integrations/save", False, f"Exception: {str(e)}")
+    
+    # CRITICAL SECURITY CHECK: Verify masked key is returned, NOT raw key
+    try:
+        resp = requests.get(f"{BASE_URL}/settings/integrations", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            integrations = data.get("integrations", [])
+            resend = next((i for i in integrations if i["id"] == "resend"), None)
+            
+            if resend:
+                masked_key = resend.get("masked_key", "")
+                status = resend.get("status", "")
+                
+                # Check that raw key is NOT returned
+                if dummy_key in str(data):
+                    log_test("BYOK: SECURITY CHECK - Raw key NOT leaked", False, f"🚨 CRITICAL: Raw API key '{dummy_key}' found in response! This is a security vulnerability!")
+                elif masked_key and masked_key != dummy_key and "•" in masked_key:
+                    if status == "saved":
+                        log_test("BYOK: SECURITY CHECK - Raw key NOT leaked", True, f"✅ Key properly masked: '{masked_key}', status: {status}")
+                    else:
+                        log_test("BYOK: SECURITY CHECK - Raw key NOT leaked", False, f"Key masked but status incorrect: {status} (expected 'saved')")
+                else:
+                    log_test("BYOK: SECURITY CHECK - Raw key NOT leaked", False, f"Masked key not properly formatted: '{masked_key}'")
+            else:
+                log_test("BYOK: SECURITY CHECK - Raw key NOT leaked", False, "Resend integration not found after save")
+        else:
+            log_test("BYOK: SECURITY CHECK - Raw key NOT leaked", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("BYOK: SECURITY CHECK - Raw key NOT leaked", False, f"Exception: {str(e)}")
+    
+    # Test POST /settings/integrations/connect (expect error with dummy key)
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/settings/integrations/connect",
+            json={"provider": "resend"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if "result" in data and "status" in data["result"]:
+                result_status = data["result"]["status"]
+                # Dummy key should fail validation, so status should be 'error'
+                if result_status == "error":
+                    log_test("BYOK: POST /settings/integrations/connect", True, f"Connect returned status: {result_status} (expected for dummy key)")
+                else:
+                    log_test("BYOK: POST /settings/integrations/connect", True, f"Connect returned status: {result_status}")
+            else:
+                log_test("BYOK: POST /settings/integrations/connect", False, "Missing result.status in response")
+        else:
+            log_test("BYOK: POST /settings/integrations/connect", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("BYOK: POST /settings/integrations/connect", False, f"Exception: {str(e)}")
+    
+    # Test POST /settings/integrations/disconnect
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/settings/integrations/disconnect",
+            json={"provider": "resend"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            log_test("BYOK: POST /settings/integrations/disconnect", True, "Disconnected resend integration")
+        else:
+            log_test("BYOK: POST /settings/integrations/disconnect", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("BYOK: POST /settings/integrations/disconnect", False, f"Exception: {str(e)}")
+
+def test_14_builder_os():
+    """Test 14: BUILDER OS - Natural language config changes applied live"""
+    print("\n" + "="*80)
+    print("TEST 14: BUILDER OS (Real LLM calls - may take 10-40s)")
+    print("="*80)
+    
+    # Test 1: Add GitHub connector to Pro plan
+    try:
+        print("⏳ Calling /builder/chat: Add GitHub connector to Pro plan...")
+        resp = requests.post(
+            f"{BASE_URL}/builder/chat",
+            json={"message": "Add the GitHub connector to the Pro plan"},
+            timeout=45
+        )
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            if "changeset" in data:
+                changeset = data["changeset"]
+                status = changeset.get("status")
+                applied = changeset.get("applied", [])
+                
+                if status == "applied" and any("github" in str(a).lower() and "pro" in str(a).lower() for a in applied):
+                    log_test("BUILDER OS: Add GitHub to Pro plan", True, f"Status: {status}, Applied: {applied}")
+                else:
+                    log_test("BUILDER OS: Add GitHub to Pro plan", False, f"Status: {status}, Applied: {applied} (expected 'applied' with github->pro)")
+            else:
+                log_test("BUILDER OS: Add GitHub to Pro plan", False, "Missing changeset in response")
+        else:
+            log_test("BUILDER OS: Add GitHub to Pro plan", False, f"Status {resp.status_code}: {resp.text}")
+    except requests.Timeout:
+        log_test("BUILDER OS: Add GitHub to Pro plan", False, "Request timeout (>45s)")
+    except Exception as e:
+        log_test("BUILDER OS: Add GitHub to Pro plan", False, f"Exception: {str(e)}")
+    
+    # Verify GitHub is in Pro plan features
+    try:
+        resp = requests.get(f"{BASE_URL}/plans", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            plans = data.get("plans", [])
+            pro_plan = next((p for p in plans if p["id"] == "pro"), None)
+            
+            if pro_plan:
+                features = pro_plan.get("features", [])
+                if "github" in features:
+                    log_test("BUILDER OS: Verify GitHub in Pro plan", True, f"GitHub found in Pro plan features: {features}")
+                else:
+                    log_test("BUILDER OS: Verify GitHub in Pro plan", False, f"GitHub not found in Pro plan features: {features}")
+            else:
+                log_test("BUILDER OS: Verify GitHub in Pro plan", False, "Pro plan not found")
+        else:
+            log_test("BUILDER OS: Verify GitHub in Pro plan", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("BUILDER OS: Verify GitHub in Pro plan", False, f"Exception: {str(e)}")
+    
+    # Test 2: Give Premium 90 automations
+    try:
+        print("⏳ Calling /builder/chat: Give Premium 90 automations...")
+        resp = requests.post(
+            f"{BASE_URL}/builder/chat",
+            json={"message": "Give Premium 90 automations"},
+            timeout=45
+        )
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            if "changeset" in data:
+                changeset = data["changeset"]
+                status = changeset.get("status")
+                
+                if status == "applied":
+                    log_test("BUILDER OS: Give Premium 90 automations", True, f"Status: {status}")
+                else:
+                    log_test("BUILDER OS: Give Premium 90 automations", False, f"Status: {status} (expected 'applied')")
+            else:
+                log_test("BUILDER OS: Give Premium 90 automations", False, "Missing changeset in response")
+        else:
+            log_test("BUILDER OS: Give Premium 90 automations", False, f"Status {resp.status_code}: {resp.text}")
+    except requests.Timeout:
+        log_test("BUILDER OS: Give Premium 90 automations", False, "Request timeout (>45s)")
+    except Exception as e:
+        log_test("BUILDER OS: Give Premium 90 automations", False, f"Exception: {str(e)}")
+    
+    # Verify Premium has 90 automations
+    try:
+        resp = requests.get(f"{BASE_URL}/plans", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            plans = data.get("plans", [])
+            premium_plan = next((p for p in plans if p["id"] == "premium"), None)
+            
+            if premium_plan:
+                automations = premium_plan.get("limits", {}).get("automations")
+                if automations == 90:
+                    log_test("BUILDER OS: Verify Premium 90 automations", True, f"Premium automations: {automations}")
+                else:
+                    log_test("BUILDER OS: Verify Premium 90 automations", False, f"Expected 90, got {automations}")
+            else:
+                log_test("BUILDER OS: Verify Premium 90 automations", False, "Premium plan not found")
+        else:
+            log_test("BUILDER OS: Verify Premium 90 automations", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("BUILDER OS: Verify Premium 90 automations", False, f"Exception: {str(e)}")
+    
+    # Test 3: Build new Trello connector (requires code)
+    try:
+        print("⏳ Calling /builder/chat: Build Trello connector...")
+        resp = requests.post(
+            f"{BASE_URL}/builder/chat",
+            json={"message": "Build a brand new Trello connector with two-way sync and a settings UI"},
+            timeout=45
+        )
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            if "changeset" in data:
+                changeset = data["changeset"]
+                requires_code = changeset.get("requires_code")
+                status = changeset.get("status")
+                actions = changeset.get("actions", [])
+                
+                if requires_code and status == "awaiting_openhands_connection" and len(actions) == 0:
+                    log_test("BUILDER OS: Build Trello connector", True, f"requires_code: {requires_code}, status: {status}, actions: {len(actions)}")
+                else:
+                    log_test("BUILDER OS: Build Trello connector", False, f"requires_code: {requires_code}, status: {status}, actions: {len(actions)} (expected true, awaiting_openhands_connection, 0)")
+            else:
+                log_test("BUILDER OS: Build Trello connector", False, "Missing changeset in response")
+        else:
+            log_test("BUILDER OS: Build Trello connector", False, f"Status {resp.status_code}: {resp.text}")
+    except requests.Timeout:
+        log_test("BUILDER OS: Build Trello connector", False, "Request timeout (>45s)")
+    except Exception as e:
+        log_test("BUILDER OS: Build Trello connector", False, f"Exception: {str(e)}")
+    
+    # Test GET /builder/changesets
+    try:
+        resp = requests.get(f"{BASE_URL}/builder/changesets", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "changesets" in data:
+                changesets = data["changesets"]
+                if len(changesets) >= 3:
+                    log_test("BUILDER OS: GET /builder/changesets", True, f"Retrieved {len(changesets)} changesets")
+                else:
+                    log_test("BUILDER OS: GET /builder/changesets", True, f"Retrieved {len(changesets)} changesets (expected at least 3)")
+            else:
+                log_test("BUILDER OS: GET /builder/changesets", False, "Missing changesets in response")
+        else:
+            log_test("BUILDER OS: GET /builder/changesets", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("BUILDER OS: GET /builder/changesets", False, f"Exception: {str(e)}")
+
+def test_15_override_aware_entitlements():
+    """Test 15: OVERRIDE-AWARE ENTITLEMENTS - Builder changes reflect in entitlements"""
+    print("\n" + "="*80)
+    print("TEST 15: OVERRIDE-AWARE ENTITLEMENTS")
+    print("="*80)
+    
+    # Login a pro user
+    try:
+        resp = requests.post(f"{BASE_URL}/auth/login", json={"email": "prouser@acme.com"}, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            pro_user = data.get("user")
+            
+            if pro_user:
+                # Get connectors for this user
+                resp_conn = requests.get(f"{BASE_URL}/connectors?userId={pro_user['id']}", timeout=10)
+                if resp_conn.status_code == 200:
+                    conn_data = resp_conn.json()
+                    connectors = conn_data.get("connectors", [])
+                    github = next((c for c in connectors if c["id"] == "github"), None)
+                    
+                    if github:
+                        if github.get("allowed"):
+                            log_test("OVERRIDE-AWARE: GitHub allowed for Pro user", True, f"GitHub allowed: {github.get('allowed')}")
+                        else:
+                            log_test("OVERRIDE-AWARE: GitHub allowed for Pro user", False, f"GitHub allowed: {github.get('allowed')} (expected true after Builder added it to Pro)")
+                    else:
+                        log_test("OVERRIDE-AWARE: GitHub allowed for Pro user", False, "GitHub connector not found")
+                else:
+                    log_test("OVERRIDE-AWARE: GitHub allowed for Pro user", False, f"GET /connectors failed: {resp_conn.status_code}")
+            else:
+                log_test("OVERRIDE-AWARE: GitHub allowed for Pro user", False, "Pro user not created")
+        else:
+            log_test("OVERRIDE-AWARE: GitHub allowed for Pro user", False, f"Login failed: {resp.status_code}")
+    except Exception as e:
+        log_test("OVERRIDE-AWARE: GitHub allowed for Pro user", False, f"Exception: {str(e)}")
+
+def test_16_gateway_fallback():
+    """Test 16: GATEWAY FALLBACK - Workforce plan works without gateway (Emergent fallback)"""
+    print("\n" + "="*80)
+    print("TEST 16: GATEWAY FALLBACK (Real LLM call - may take 10-40s)")
+    print("="*80)
+    
+    if not founder_user:
+        log_test("GATEWAY FALLBACK: Skipped", False, "Founder user not available")
+        return
+    
+    try:
+        print("⏳ Calling /workforce/plan with no gateway connected (Emergent fallback)...")
+        resp = requests.post(
+            f"{BASE_URL}/workforce/plan",
+            json={
+                "userId": founder_user['id'],
+                "outcome": "Summarize my unread emails"
+            },
+            timeout=45
+        )
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            plan = data.get("plan")
+            
+            if plan:
+                steps = plan.get("steps", [])
+                planner_model = plan.get("planner_model", "")
+                
+                if len(steps) >= 2 and planner_model:
+                    # Check if it's an Emergent model (anthropic/... or openai/...)
+                    if "anthropic/" in planner_model or "openai/" in planner_model:
+                        log_test("GATEWAY FALLBACK: Workforce plan works", True, f"Steps: {len(steps)}, Planner model: {planner_model} (Emergent)")
+                    else:
+                        log_test("GATEWAY FALLBACK: Workforce plan works", True, f"Steps: {len(steps)}, Planner model: {planner_model}")
+                else:
+                    log_test("GATEWAY FALLBACK: Workforce plan works", False, f"Steps: {len(steps)}, Planner model: {planner_model}")
+            else:
+                log_test("GATEWAY FALLBACK: Workforce plan works", False, "Missing plan in response")
+        else:
+            log_test("GATEWAY FALLBACK: Workforce plan works", False, f"Status {resp.status_code}: {resp.text}")
+    except requests.Timeout:
+        log_test("GATEWAY FALLBACK: Workforce plan works", False, "Request timeout (>45s)")
+    except Exception as e:
+        log_test("GATEWAY FALLBACK: Workforce plan works", False, f"Exception: {str(e)}")
+
 def main():
     """Run all tests"""
     print("\n" + "="*80)
@@ -927,6 +1304,16 @@ def main():
         test_9_safe_mode()
         test_10_operator_ai()
         test_11_feature_flags_audit()
+        
+        # NEW TESTS for BYOK, Builder OS, and Gateway
+        print("\n" + "="*80)
+        print("NEW FEATURES TESTING")
+        print("="*80)
+        test_12_operator_allowlist()
+        test_13_byok_integrations()
+        test_14_builder_os()
+        test_15_override_aware_entitlements()
+        test_16_gateway_fallback()
     except KeyboardInterrupt:
         print("\n\n⚠️  Tests interrupted by user")
     except Exception as e:

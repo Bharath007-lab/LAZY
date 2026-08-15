@@ -6,9 +6,11 @@ import { FEATURES } from '@/lib/lazy/config/features'
 import { AGENTS } from '@/lib/lazy/config/agents'
 import { MODELS, getModel } from '@/lib/lazy/config/models'
 import { CONNECTORS, getConnector } from '@/lib/lazy/config/connectors'
-import { entitlementSnapshot, canUseFeature, canUseConnector } from '@/lib/lazy/entitlements'
+import { entitlementSnapshot, canUseFeature, canUseConnector, setOverrides, getEffectiveFeatures, getPlan } from '@/lib/lazy/entitlements'
 import { setModelEnabled, getDisabledModels } from '@/lib/lazy/modelRouter'
 import { planOutcome, executeStep, extractInsights, operatorAnswer } from '@/lib/lazy/runtime'
+import { listIntegrations, saveIntegration, connectIntegration, disconnectIntegration, isOpenHandsConnected } from '@/lib/lazy/integrations'
+import { builderChat } from '@/lib/lazy/builder'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -95,6 +97,8 @@ async function handle(request, { params }) {
 
   try {
     const db = await getDb()
+    const cfg = await getConfig(db)
+    setOverrides(cfg) // make entitlement reads reflect live Builder OS config
 
     if (route === '/root' || route === '/') return json({ service: 'LAZY', status: 'ok' })
 
@@ -113,7 +117,7 @@ async function handle(request, { params }) {
 
     // ---- BILLING (demo plan change) ----
     if (route === '/billing/change-plan' && method === 'POST') {
-      if (!PLANS[body.plan]) return err('invalid plan')
+      if (!PLAN_ORDER.includes(body.plan)) return err('invalid plan')
       const user = await db.collection('users').findOne({ id: body.userId })
       if (!user) return err('user not found', 404)
       await db.collection('users').updateOne({ id: user.id }, { $set: { plan: body.plan } })
@@ -122,12 +126,11 @@ async function handle(request, { params }) {
       return json({ user: clean(updated), entitlements: entitlementSnapshot(updated.plan, updated.used_task_units) })
     }
 
-    // ---- REGISTRIES (config-driven) ----
-    if (route === '/plans' && method === 'GET') return json({ plans: PLAN_ORDER.map((p) => PLANS[p]) })
+    // ---- REGISTRIES (config-driven, override-aware) ----
+    if (route === '/plans' && method === 'GET') return json({ plans: PLAN_ORDER.map((p) => getPlan(p)) })
     if (route === '/agents' && method === 'GET') return json({ agents: AGENTS })
     if (route === '/features' && method === 'GET') {
-      const cfg = await getConfig(db)
-      return json({ features: FEATURES.map((f) => ({ ...f, flag: cfg.feature_flags[f.id] || f.flag })) })
+      return json({ features: getEffectiveFeatures() })
     }
     if (route === '/models' && method === 'GET') {
       const disabled = new Set(getDisabledModels())
@@ -179,7 +182,7 @@ async function handle(request, { params }) {
       const ent = entitlementSnapshot(user.plan, user.used_task_units)
       const states = await db.collection('connectors_state').find({ user_id: user.id, status: 'connected' }).toArray()
       const connectors = states.map((s) => getConnector(s.connector_id)?.name).filter(Boolean)
-      const plan = await planOutcome({ outcome: body.outcome, connectors, userId: user.id, priority: PLANS[user.plan].priority_routing })
+      const plan = await planOutcome({ outcome: body.outcome, connectors, userId: user.id, priority: getPlan(user.plan).priority_routing })
       const overBudget = plan.total_task_units > ent.remaining_task_units
       return json({ plan, entitlements: ent, over_budget: overBudget })
     }
@@ -203,7 +206,7 @@ async function handle(request, { params }) {
         if (cfg.kill_switches.agents?.[step.agent_id] === false) {
           return Promise.resolve({ ...step, status: 'blocked', output: null, approval_reason: 'Agent disabled by operator kill switch.' })
         }
-        return executeStep({ step, outcome, userId: user.id, priority: PLANS[user.plan].priority_routing, safeMode })
+        return executeStep({ step, outcome, userId: user.id, priority: getPlan(user.plan).priority_routing, safeMode })
       }))
 
       const anyFailed = executed.some((s) => s.status === 'failed')
@@ -218,7 +221,7 @@ async function handle(request, { params }) {
       const task = {
         id: randomUUID(), user_id: user.id, org_id: user.org_id,
         source: 'customer', requested_action: outcome, summary: body.summary || '',
-        status, priority: PLANS[user.plan].priority_routing ? 'high' : 'normal',
+        status, priority: getPlan(user.plan).priority_routing ? 'high' : 'normal',
         task_units: usedUnits, steps: executed,
         time_saved_minutes: body.time_saved_minutes || 0,
         planner_model: body.planner_model || null, safe_mode: safeMode,
@@ -358,6 +361,77 @@ async function handle(request, { params }) {
       }
     }
 
+    // ---- SETTINGS: BYOK INTEGRATIONS ----
+    if (route === '/settings/integrations' && method === 'GET') {
+      return json({ integrations: await listIntegrations() })
+    }
+    if (route === '/settings/integrations/save' && method === 'POST') {
+      await saveIntegration(body.provider, body.data || {})
+      await audit(db, { actor: 'operator', action: 'integration.save', target: body.provider })
+      return json({ integrations: await listIntegrations() })
+    }
+    if (route === '/settings/integrations/connect' && method === 'POST') {
+      const r = await connectIntegration(body.provider)
+      await audit(db, { actor: 'operator', action: 'integration.connect', target: body.provider, meta: { status: r.status } })
+      return json({ result: r, integrations: await listIntegrations() })
+    }
+    if (route === '/settings/integrations/disconnect' && method === 'POST') {
+      await disconnectIntegration(body.provider)
+      await audit(db, { actor: 'operator', action: 'integration.disconnect', target: body.provider })
+      return json({ integrations: await listIntegrations() })
+    }
+
+    // ---- BUILDER OS: natural-language product changes + ChangeSets ----
+    if (route === '/builder/chat' && method === 'POST') {
+      if (!body.message) return err('message required')
+      const snapshot = {
+        features: getEffectiveFeatures().map((f) => f.id).join(', '),
+        models: MODELS.map((m) => m.id).join(', '),
+        current: {
+          plans: PLAN_ORDER.map((p) => { const pl = getPlan(p); return { id: pl.id, price: pl.price, task_units: pl.task_units, limits: pl.limits, features: pl.features } }),
+          feature_flags: cfg.feature_flags,
+          kill_switches: cfg.kill_switches,
+        },
+      }
+      const cs = await builderChat({ message: body.message, snapshot })
+      const applied = []
+      if (!cs.requires_code && Array.isArray(cs.actions)) {
+        for (const a of cs.actions) {
+          try {
+            if (a.type === 'set_feature_plan') { await db.collection('config').updateOne({ id: 'system' }, { $set: { [`overrides.feature_plan.${a.feature}`]: a.plans } }); applied.push(`${a.feature} → ${a.plans.join('/')}`) }
+            else if (a.type === 'set_plan_limit') { await db.collection('config').updateOne({ id: 'system' }, { $set: { [`overrides.plans.${a.plan}.limits.${a.key}`]: a.value } }); applied.push(`${a.plan} ${a.key} = ${a.value}`) }
+            else if (a.type === 'set_plan_price') { await db.collection('config').updateOne({ id: 'system' }, { $set: { [`overrides.plans.${a.plan}.price`]: a.value } }); applied.push(`${a.plan} price = $${a.value}`) }
+            else if (a.type === 'set_plan_task_units') { await db.collection('config').updateOne({ id: 'system' }, { $set: { [`overrides.plans.${a.plan}.task_units`]: a.value } }); applied.push(`${a.plan} task units = ${a.value}`) }
+            else if (a.type === 'set_feature_flag') { await db.collection('config').updateOne({ id: 'system' }, { $set: { [`feature_flags.${a.feature}`]: a.flag } }); applied.push(`${a.feature} flag → ${a.flag}`) }
+            else if (a.type === 'toggle_kill_switch') { await db.collection('config').updateOne({ id: 'system' }, { $set: { [`kill_switches.${a.key}`]: a.value } }); applied.push(`${a.key} = ${a.value}`) }
+            else if (a.type === 'toggle_model') { setModelEnabled(a.model, a.enabled); const dis = getDisabledModels(); await db.collection('config').updateOne({ id: 'system' }, { $set: { disabled_models: dis } }); applied.push(`model ${a.model} ${a.enabled ? 'enabled' : 'disabled'}`) }
+          } catch (e) { /* skip bad action */ }
+        }
+      }
+      const ohConnected = await isOpenHandsConnected()
+      const changeset = {
+        id: randomUUID(),
+        request: body.message,
+        summary: cs.summary || '',
+        message: cs.message || '',
+        risk: cs.risk || 'low',
+        requires_code: !!cs.requires_code,
+        code_plan: cs.code_plan || null,
+        actions: cs.actions || [],
+        applied,
+        status: cs.requires_code ? (ohConnected ? 'dispatched_to_openhands' : 'awaiting_openhands_connection') : (applied.length ? 'applied' : 'no_op'),
+        planner_model: cs.planner_model || null,
+        createdAt: new Date(),
+      }
+      await db.collection('changesets').insertOne(changeset)
+      await audit(db, { actor: 'operator', action: 'builder.changeset', target: changeset.id, meta: { status: changeset.status, applied: applied.length } })
+      return json({ changeset: clean(changeset) })
+    }
+    if (route === '/builder/changesets' && method === 'GET') {
+      const items = await db.collection('changesets').find({}).sort({ createdAt: -1 }).limit(50).toArray()
+      return json({ changesets: clean(items) })
+    }
+
     return err(`Route ${route} not found`, 404)
   } catch (e) {
     console.error('API Error:', e)
@@ -370,7 +444,7 @@ async function buildStats(db) {
   const users = await db.collection('users').find({}).toArray()
   const planDist = {}
   let mrr = 0
-  for (const u of users) { planDist[u.plan] = (planDist[u.plan] || 0) + 1; mrr += PLANS[u.plan]?.price || 0 }
+  for (const u of users) { planDist[u.plan] = (planDist[u.plan] || 0) + 1; mrr += getPlan(u.plan)?.price || 0 }
   const tasks = await db.collection('tasks').find({}).toArray()
   const completed = tasks.filter((t) => t.status === 'completed').length
   const failed = tasks.filter((t) => t.status === 'failed').length
