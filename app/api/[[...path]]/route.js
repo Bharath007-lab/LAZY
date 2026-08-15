@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { randomUUID, randomInt } from 'crypto'
 import { getDb, clean } from '@/lib/lazy/mongo'
 import { hmac } from '@/lib/lazy/crypto'
+import { encrypt, decrypt } from '@/lib/lazy/crypto'
 import { PLANS, PLAN_ORDER, AI_COST_PER_UNIT, TASK_UNIT_WEIGHTS } from '@/lib/lazy/config/plans'
 import { FEATURES } from '@/lib/lazy/config/features'
 import { AGENTS } from '@/lib/lazy/config/agents'
@@ -10,7 +11,7 @@ import { CONNECTORS, getConnector } from '@/lib/lazy/config/connectors'
 import { entitlementSnapshot, canUseFeature, canUseConnector, setOverrides, getEffectiveFeatures, getPlan } from '@/lib/lazy/entitlements'
 import { setModelEnabled, getDisabledModels } from '@/lib/lazy/modelRouter'
 import { planOutcome, executeStep, extractInsights, operatorAnswer } from '@/lib/lazy/runtime'
-import { listIntegrations, saveIntegration, connectIntegration, disconnectIntegration, isOpenHandsConnected, sendOtpEmail } from '@/lib/lazy/integrations'
+import { listIntegrations, saveIntegration, connectIntegration, disconnectIntegration, isOpenHandsConnected, sendOtpEmail, getGoogleCreds, GOOGLE, dispatchOpenHands, pollOpenHands } from '@/lib/lazy/integrations'
 import { builderChat } from '@/lib/lazy/builder'
 
 // ---------------------------------------------------------------------------
@@ -152,6 +153,58 @@ async function handle(request, { params }) {
       return json({ user: clean(user), entitlements: entitlementSnapshot(user.plan, user.used_task_units) })
     }
 
+    // ---- GOOGLE OAUTH (BYOK) ----
+    if (route === '/oauth/google/start' && method === 'GET') {
+      const BASE = process.env.NEXT_PUBLIC_BASE_URL.replace(/\/$/, '')
+      const creds = await getGoogleCreds()
+      if (!creds) return cors(NextResponse.redirect(`${BASE}/?google=not_configured`))
+      const state = Buffer.from(encrypt(JSON.stringify({ userId: q('userId'), connector: q('connector') || 'gmail', ts: Date.now() }))).toString('base64url')
+      const params = new URLSearchParams({
+        client_id: creds.clientId,
+        redirect_uri: `${BASE}/api/oauth/google/callback`,
+        response_type: 'code',
+        scope: GOOGLE.scopes.join(' '),
+        access_type: 'offline',
+        include_granted_scopes: 'true',
+        prompt: 'consent',
+        state,
+      })
+      return cors(NextResponse.redirect(`${GOOGLE.auth}?${params}`))
+    }
+    if (route === '/oauth/google/callback' && method === 'GET') {
+      const BASE = process.env.NEXT_PUBLIC_BASE_URL.replace(/\/$/, '')
+      if (q('error')) return cors(NextResponse.redirect(`${BASE}/?google=denied`))
+      const code = q('code'); const stateRaw = q('state')
+      let state
+      try { state = JSON.parse(decrypt(Buffer.from(stateRaw, 'base64url').toString('utf8'))) } catch { return cors(NextResponse.redirect(`${BASE}/?google=bad_state`)) }
+      if (!code || !state || Date.now() - state.ts > 10 * 60 * 1000) return cors(NextResponse.redirect(`${BASE}/?google=expired`))
+      const creds = await getGoogleCreds()
+      if (!creds) return cors(NextResponse.redirect(`${BASE}/?google=not_configured`))
+      const tr = await fetch(GOOGLE.token, {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ client_id: creds.clientId, client_secret: creds.clientSecret, code, redirect_uri: `${BASE}/api/oauth/google/callback`, grant_type: 'authorization_code' }),
+      })
+      const tokens = await tr.json().catch(() => ({}))
+      if (!tr.ok) return cors(NextResponse.redirect(`${BASE}/?google=token_error`))
+      const upd = {
+        access_token: encrypt(tokens.access_token || ''),
+        expires_at: new Date(Date.now() + (tokens.expires_in || 3600) * 1000),
+        scopes: (tokens.scope || GOOGLE.scopes.join(' ')).split(' '),
+        updatedAt: new Date(),
+      }
+      if (tokens.refresh_token) upd.refresh_token = encrypt(tokens.refresh_token)
+      await db.collection('google_connections').updateOne({ user_id: state.userId }, { $set: upd, $setOnInsert: { user_id: state.userId } }, { upsert: true })
+      for (const cid of ['gmail', 'calendar']) {
+        await db.collection('connectors_state').updateOne(
+          { user_id: state.userId, connector_id: cid },
+          { $set: { status: 'connected', connectedAt: new Date(), oauth: 'google' }, $setOnInsert: { id: randomUUID() } },
+          { upsert: true }
+        )
+      }
+      await audit(db, { actor: state.userId, action: 'connector.oauth_connected', target: 'google', meta: { scopes: upd.scopes } })
+      return cors(NextResponse.redirect(`${BASE}/?google=connected`))
+    }
+
     // ---- BILLING (demo plan change) ----
     if (route === '/billing/change-plan' && method === 'POST') {
       if (!PLAN_ORDER.includes(body.plan)) return err('invalid plan')
@@ -179,10 +232,13 @@ async function handle(request, { params }) {
       const states = await db.collection('connectors_state').find({ user_id: q('userId') }).toArray()
       const map = Object.fromEntries(states.map((s) => [s.connector_id, s.status]))
       const user = await db.collection('users').findOne({ id: q('userId') })
+      const googleReady = ['saved', 'connected'].includes(cfg.integrations?.google?.status)
       return json({
+        google_ready: googleReady,
         connectors: CONNECTORS.map((c) => ({
           ...c,
           connected: map[c.id] === 'connected',
+          oauth: ['gmail', 'calendar', 'drive'].includes(c.id) ? 'google' : null,
           allowed: user ? canUseConnector(user.plan, c.id) : false,
         })),
       })
@@ -446,6 +502,10 @@ async function handle(request, { params }) {
         }
       }
       const ohConnected = await isOpenHandsConnected()
+      let oh = null
+      if (cs.requires_code && ohConnected) {
+        oh = await dispatchOpenHands(`${cs.summary || body.message}\n\n${cs.code_plan || ''}`)
+      }
       const changeset = {
         id: randomUUID(),
         request: body.message,
@@ -456,7 +516,10 @@ async function handle(request, { params }) {
         code_plan: cs.code_plan || null,
         actions: cs.actions || [],
         applied,
-        status: cs.requires_code ? (ohConnected ? 'dispatched_to_openhands' : 'awaiting_openhands_connection') : (applied.length ? 'applied' : 'no_op'),
+        openhands: oh && oh.ok ? { conversation_id: oh.conversation_id, status: oh.status } : null,
+        status: cs.requires_code
+          ? (oh && oh.ok ? 'dispatched_to_openhands' : (ohConnected ? 'openhands_error' : 'awaiting_openhands_connection'))
+          : (applied.length ? 'applied' : 'no_op'),
         planner_model: cs.planner_model || null,
         createdAt: new Date(),
       }
@@ -467,6 +530,13 @@ async function handle(request, { params }) {
     if (route === '/builder/changesets' && method === 'GET') {
       const items = await db.collection('changesets').find({}).sort({ createdAt: -1 }).limit(50).toArray()
       return json({ changesets: clean(items) })
+    }
+    if (route === '/builder/changesets/status' && method === 'POST') {
+      const csDoc = await db.collection('changesets').findOne({ id: body.id })
+      if (!csDoc?.openhands?.conversation_id) return err('No OpenHands job for this ChangeSet', 400)
+      const r = await pollOpenHands(csDoc.openhands.conversation_id)
+      if (r.ok) await db.collection('changesets').updateOne({ id: body.id }, { $set: { 'openhands.status': r.status } })
+      return json({ ok: r.ok, status: r.status || null, reason: r.reason || null })
     }
 
     return err(`Route ${route} not found`, 404)

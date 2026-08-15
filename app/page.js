@@ -144,6 +144,15 @@ export default function App() {
     else setReady(true)
   }, [])
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const g = new URLSearchParams(window.location.search).get('google')
+    if (!g) return
+    const msg = { connected: ['success', 'Google connected — Gmail & Calendar are live'], not_configured: ['error', 'Add Google client ID/secret in Integrations first'], denied: ['error', 'Google consent was denied'], token_error: ['error', 'Google token exchange failed'], expired: ['error', 'Login expired, try again'], bad_state: ['error', 'Invalid OAuth state'] }[g]
+    if (msg) toast[msg[0] === 'success' ? 'success' : 'error'](msg[1])
+    window.history.replaceState({}, '', window.location.pathname)
+  }, [])
+
   if (!ready) return <div className="flex min-h-screen items-center justify-center"><Loader2 className="h-6 w-6 animate-spin text-emerald-400" /></div>
   if (!session) return <Login onLogin={setSession} />
 
@@ -527,13 +536,14 @@ function CommitmentsSection({ uid }) {
 // ---------- CONNECTIONS ----------
 function ConnectionsSection({ uid }) {
   const [connectors, setConnectors] = useState(null)
-  const load = useCallback(() => api('/connectors?userId=' + uid).then((d) => setConnectors(d.connectors)), [uid])
+  const [googleReady, setGoogleReady] = useState(false)
+  const load = useCallback(() => api('/connectors?userId=' + uid).then((d) => { setConnectors(d.connectors); setGoogleReady(d.google_ready) }), [uid])
   useEffect(() => { load() }, [load])
   const toggle = async (c) => {
     try {
-      if (c.connected) { await api('/connectors/disconnect', 'POST', { userId: uid, id: c.id }); toast('Disconnected ' + c.name) }
-      else { await api('/connectors/connect', 'POST', { userId: uid, id: c.id }); toast.success('Connected ' + c.name) }
-      load()
+      if (c.connected) { await api('/connectors/disconnect', 'POST', { userId: uid, id: c.id }); toast('Disconnected ' + c.name); load(); return }
+      if (c.oauth === 'google' && googleReady) { window.location.href = `/api/oauth/google/start?userId=${uid}&connector=${c.id}`; return }
+      await api('/connectors/connect', 'POST', { userId: uid, id: c.id }); toast.success('Connected ' + c.name); load()
     } catch (e) { toast.error(e.message) }
   }
   return (
@@ -563,7 +573,7 @@ function ConnectionsSection({ uid }) {
                   <span className="text-[11px] text-zinc-600">{c.allowed ? `Read ${c.read ? '✓' : '✗'} · Write ${c.write ? '✓' : '✗'}` : 'Not in your plan'}</span>
                   <Button size="sm" disabled={soon || !c.allowed} onClick={() => toggle(c)}
                     className={`h-7 text-xs ${c.connected ? 'bg-white/10 hover:bg-white/20' : 'bg-emerald-500/90 text-black hover:bg-emerald-400'}`}>
-                    {c.connected ? 'Disconnect' : soon ? 'Coming soon' : 'Connect'}
+                    {c.connected ? 'Disconnect' : soon ? 'Coming soon' : (c.oauth === 'google' && googleReady ? 'Connect with Google' : 'Connect')}
                   </Button>
                 </div>
               </Glass>
@@ -1049,7 +1059,13 @@ function OpBuilder() {
                 <div className="mt-2 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3 text-xs text-violet-200">
                   <div className="mb-1 flex items-center gap-1.5 font-medium"><GitBranch className="h-3 w-3" /> Engineering ChangeSet</div>
                   <p className="text-zinc-400">{m.cs.code_plan}</p>
-                  <p className="mt-2 text-[11px] text-amber-300">{m.cs.status === 'awaiting_openhands_connection' ? 'Connect OpenHands in Integrations to auto-build this in an isolated workspace with tests + preview.' : 'Dispatched to OpenHands for a preview build.'}</p>
+                  <p className="mt-2 text-[11px] text-amber-300">{m.cs.status === 'awaiting_openhands_connection' ? 'Connect OpenHands in Integrations to auto-build this in an isolated workspace with tests + preview.' : m.cs.status === 'openhands_error' ? 'OpenHands runtime unreachable — check the endpoint/token in Integrations.' : 'Dispatched to OpenHands for a sandboxed build.'}</p>
+                  {m.cs.openhands?.conversation_id && (
+                    <div className="mt-2 flex items-center gap-2 text-[11px] text-violet-300">
+                      <span>Job {String(m.cs.openhands.conversation_id).slice(0, 8)} · {m.cs.openhands.status}</span>
+                      <button onClick={async () => { try { const r = await api('/builder/changesets/status', 'POST', { id: m.cs.id }); r.ok ? toast.success('OpenHands: ' + r.status) : toast.error('OpenHands: ' + (r.reason || 'unreachable')) } catch (e) { toast.error(e.message) } }} className="underline hover:text-violet-200">refresh status</button>
+                    </div>
+                  )}
                 </div>
               )}
               {m.cs.planner_model && <div className="mt-2 text-[10px] text-zinc-600">{m.cs.planner_model}</div>}
