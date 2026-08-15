@@ -1284,6 +1284,247 @@ def test_16_gateway_fallback():
     except Exception as e:
         log_test("GATEWAY FALLBACK: Workforce plan works", False, f"Exception: {str(e)}")
 
+def test_17_otp_auth_encryption():
+    """Test 17: OTP AUTH + KEY ENCRYPTION - Operator OTP login and key encryption at rest"""
+    print("\n" + "="*80)
+    print("TEST 17: OTP AUTH + KEY ENCRYPTION (CRITICAL SECURITY)")
+    print("="*80)
+    
+    # Test 1: Non-operator (jane@acme.com) - no OTP required
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/auth/request-code",
+            json={"email": "jane@acme.com"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            otp_required = data.get("otp_required")
+            user = data.get("user")
+            entitlements = data.get("entitlements")
+            
+            if otp_required == False and user and entitlements:
+                log_test("OTP AUTH: Non-operator no OTP", True, f"otp_required: {otp_required}, user returned immediately")
+            else:
+                log_test("OTP AUTH: Non-operator no OTP", False, f"otp_required: {otp_required}, user: {bool(user)}, entitlements: {bool(entitlements)}")
+        else:
+            log_test("OTP AUTH: Non-operator no OTP", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("OTP AUTH: Non-operator no OTP", False, f"Exception: {str(e)}")
+    
+    # Test 2: Operator (gbsreddy007@gmail.com) - OTP required with dev_code
+    dev_code = None
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/auth/request-code",
+            json={"email": "gbsreddy007@gmail.com"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            otp_required = data.get("otp_required")
+            delivery = data.get("delivery")
+            dev_code = data.get("dev_code")
+            
+            if otp_required == True and delivery == "dev" and dev_code and len(str(dev_code)) == 6 and str(dev_code).isdigit():
+                log_test("OTP AUTH: Operator OTP required", True, f"otp_required: {otp_required}, delivery: {delivery}, dev_code: {dev_code} (6-digit)")
+            else:
+                log_test("OTP AUTH: Operator OTP required", False, f"otp_required: {otp_required}, delivery: {delivery}, dev_code: {dev_code} (expected 6-digit numeric)")
+        else:
+            log_test("OTP AUTH: Operator OTP required", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("OTP AUTH: Operator OTP required", False, f"Exception: {str(e)}")
+    
+    # Test 3: Wrong OTP code - 401 error
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/auth/verify-code",
+            json={"email": "gbsreddy007@gmail.com", "code": "000000"},
+            timeout=10
+        )
+        if resp.status_code == 401:
+            data = resp.json()
+            error = data.get("error", "")
+            if "invalid" in error.lower() or "code" in error.lower():
+                log_test("OTP AUTH: Wrong code 401", True, f"Status: 401, Error: {error}")
+            else:
+                log_test("OTP AUTH: Wrong code 401", True, f"Status: 401 (correct), Error: {error}")
+        else:
+            log_test("OTP AUTH: Wrong code 401", False, f"Expected 401, got {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("OTP AUTH: Wrong code 401", False, f"Exception: {str(e)}")
+    
+    # Test 4: Correct OTP code - 200 with owner role
+    # First, request a fresh code (each request replaces the stored code)
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/auth/request-code",
+            json={"email": "gbsreddy007@gmail.com"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            fresh_dev_code = data.get("dev_code")
+            
+            if fresh_dev_code:
+                # Now verify with the fresh code
+                resp_verify = requests.post(
+                    f"{BASE_URL}/auth/verify-code",
+                    json={"email": "gbsreddy007@gmail.com", "code": str(fresh_dev_code)},
+                    timeout=10
+                )
+                
+                if resp_verify.status_code == 200:
+                    verify_data = resp_verify.json()
+                    user = verify_data.get("user")
+                    entitlements = verify_data.get("entitlements")
+                    
+                    if user and user.get("role") == "owner" and entitlements:
+                        log_test("OTP AUTH: Correct code 200 owner", True, f"Role: {user.get('role')}, entitlements present")
+                    else:
+                        log_test("OTP AUTH: Correct code 200 owner", False, f"Role: {user.get('role') if user else 'N/A'}, expected 'owner'")
+                else:
+                    log_test("OTP AUTH: Correct code 200 owner", False, f"Status {resp_verify.status_code}: {resp_verify.text}")
+            else:
+                log_test("OTP AUTH: Correct code 200 owner", False, "Failed to get fresh dev_code")
+        else:
+            log_test("OTP AUTH: Correct code 200 owner", False, f"Failed to request fresh code: {resp.status_code}")
+    except Exception as e:
+        log_test("OTP AUTH: Correct code 200 owner", False, f"Exception: {str(e)}")
+    
+    # Test 5: Attempt lockout - 5 wrong attempts -> 429
+    try:
+        # Request a fresh code first
+        resp = requests.post(
+            f"{BASE_URL}/auth/request-code",
+            json={"email": "gbsreddy007@gmail.com"},
+            timeout=10
+        )
+        
+        if resp.status_code == 200:
+            # Try wrong code 5 times
+            for i in range(5):
+                resp_wrong = requests.post(
+                    f"{BASE_URL}/auth/verify-code",
+                    json={"email": "gbsreddy007@gmail.com", "code": "999999"},
+                    timeout=10
+                )
+                # Should get 401 for first 4 attempts
+            
+            # 6th attempt should return 429
+            resp_lockout = requests.post(
+                f"{BASE_URL}/auth/verify-code",
+                json={"email": "gbsreddy007@gmail.com", "code": "999999"},
+                timeout=10
+            )
+            
+            if resp_lockout.status_code == 429:
+                error = resp_lockout.json().get("error", "")
+                log_test("OTP AUTH: Attempt lockout 429", True, f"Status: 429 after 5 wrong attempts, Error: {error}")
+            else:
+                log_test("OTP AUTH: Attempt lockout 429", False, f"Expected 429, got {resp_lockout.status_code}: {resp_lockout.text}")
+            
+            # Verify fresh request-code allows login again
+            resp_fresh = requests.post(
+                f"{BASE_URL}/auth/request-code",
+                json={"email": "gbsreddy007@gmail.com"},
+                timeout=10
+            )
+            
+            if resp_fresh.status_code == 200:
+                fresh_code = resp_fresh.json().get("dev_code")
+                if fresh_code:
+                    resp_verify = requests.post(
+                        f"{BASE_URL}/auth/verify-code",
+                        json={"email": "gbsreddy007@gmail.com", "code": str(fresh_code)},
+                        timeout=10
+                    )
+                    if resp_verify.status_code == 200:
+                        log_test("OTP AUTH: Fresh code after lockout", True, "Fresh request-code allows login after lockout")
+                    else:
+                        log_test("OTP AUTH: Fresh code after lockout", False, f"Fresh code failed: {resp_verify.status_code}")
+                else:
+                    log_test("OTP AUTH: Fresh code after lockout", False, "No dev_code in fresh request")
+            else:
+                log_test("OTP AUTH: Fresh code after lockout", False, f"Fresh request failed: {resp_fresh.status_code}")
+        else:
+            log_test("OTP AUTH: Attempt lockout 429", False, f"Failed to request code: {resp.status_code}")
+    except Exception as e:
+        log_test("OTP AUTH: Attempt lockout 429", False, f"Exception: {str(e)}")
+    
+    # Test 6: Encryption + Masking - CRITICAL SECURITY CHECK
+    secret_key = "sk-or-supersecret-xyz9999"
+    try:
+        # Save integration with secret key
+        resp = requests.post(
+            f"{BASE_URL}/settings/integrations/save",
+            json={"provider": "openrouter", "data": {"key": secret_key, "model": "openai/gpt-4o-mini"}},
+            timeout=10
+        )
+        
+        if resp.status_code == 200:
+            # Get integrations and verify masking
+            resp_get = requests.get(f"{BASE_URL}/settings/integrations", timeout=10)
+            
+            if resp_get.status_code == 200:
+                data = resp_get.json()
+                integrations = data.get("integrations", [])
+                openrouter = next((i for i in integrations if i["id"] == "openrouter"), None)
+                
+                if openrouter:
+                    masked_key = openrouter.get("masked_key", "")
+                    full_response = resp_get.text
+                    
+                    # Check 1: masked_key should look like "sk-••••9999"
+                    expected_mask_pattern = masked_key.startswith("sk-") and "••••" in masked_key and masked_key.endswith("9999")
+                    
+                    # Check 2: "supersecret" should NOT appear anywhere in response
+                    supersecret_leaked = "supersecret" in full_response
+                    
+                    # Check 3: Full raw key should NOT appear in response
+                    raw_key_leaked = secret_key in full_response
+                    
+                    if expected_mask_pattern and not supersecret_leaked and not raw_key_leaked:
+                        log_test("OTP AUTH: Encryption + Masking", True, f"✅ CRITICAL: Key properly masked as '{masked_key}', 'supersecret' NOT leaked, raw key NOT leaked")
+                    else:
+                        failures = []
+                        if not expected_mask_pattern:
+                            failures.append(f"Mask pattern incorrect: '{masked_key}'")
+                        if supersecret_leaked:
+                            failures.append("🚨 CRITICAL: 'supersecret' found in response!")
+                        if raw_key_leaked:
+                            failures.append(f"🚨 CRITICAL: Raw key '{secret_key}' found in response!")
+                        log_test("OTP AUTH: Encryption + Masking", False, f"SECURITY FAILURE: {', '.join(failures)}")
+                else:
+                    log_test("OTP AUTH: Encryption + Masking", False, "OpenRouter integration not found after save")
+            else:
+                log_test("OTP AUTH: Encryption + Masking", False, f"GET /settings/integrations failed: {resp_get.status_code}")
+        else:
+            log_test("OTP AUTH: Encryption + Masking", False, f"Save integration failed: {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("OTP AUTH: Encryption + Masking", False, f"Exception: {str(e)}")
+    
+    # Test 7: Legacy login endpoint still works
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/auth/login",
+            json={"email": "gbsreddy007@gmail.com"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            user = data.get("user")
+            entitlements = data.get("entitlements")
+            
+            if user and entitlements:
+                log_test("OTP AUTH: Legacy login endpoint", True, f"Legacy /auth/login still works, returns user + entitlements")
+            else:
+                log_test("OTP AUTH: Legacy login endpoint", False, f"User: {bool(user)}, Entitlements: {bool(entitlements)}")
+        else:
+            log_test("OTP AUTH: Legacy login endpoint", False, f"Status {resp.status_code}: {resp.text}")
+    except Exception as e:
+        log_test("OTP AUTH: Legacy login endpoint", False, f"Exception: {str(e)}")
+
 def main():
     """Run all tests"""
     print("\n" + "="*80)
@@ -1314,6 +1555,12 @@ def main():
         test_14_builder_os()
         test_15_override_aware_entitlements()
         test_16_gateway_fallback()
+        
+        # OTP AUTH + ENCRYPTION TEST
+        print("\n" + "="*80)
+        print("OTP AUTH + KEY ENCRYPTION TESTING")
+        print("="*80)
+        test_17_otp_auth_encryption()
     except KeyboardInterrupt:
         print("\n\n⚠️  Tests interrupted by user")
     except Exception as e:

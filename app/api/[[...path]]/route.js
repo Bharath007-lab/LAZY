@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
-import { randomUUID } from 'crypto'
+import { randomUUID, randomInt } from 'crypto'
 import { getDb, clean } from '@/lib/lazy/mongo'
+import { hmac } from '@/lib/lazy/crypto'
 import { PLANS, PLAN_ORDER, AI_COST_PER_UNIT, TASK_UNIT_WEIGHTS } from '@/lib/lazy/config/plans'
 import { FEATURES } from '@/lib/lazy/config/features'
 import { AGENTS } from '@/lib/lazy/config/agents'
@@ -9,7 +10,7 @@ import { CONNECTORS, getConnector } from '@/lib/lazy/config/connectors'
 import { entitlementSnapshot, canUseFeature, canUseConnector, setOverrides, getEffectiveFeatures, getPlan } from '@/lib/lazy/entitlements'
 import { setModelEnabled, getDisabledModels } from '@/lib/lazy/modelRouter'
 import { planOutcome, executeStep, extractInsights, operatorAnswer } from '@/lib/lazy/runtime'
-import { listIntegrations, saveIntegration, connectIntegration, disconnectIntegration, isOpenHandsConnected } from '@/lib/lazy/integrations'
+import { listIntegrations, saveIntegration, connectIntegration, disconnectIntegration, isOpenHandsConnected, sendOtpEmail } from '@/lib/lazy/integrations'
 import { builderChat } from '@/lib/lazy/builder'
 
 // ---------------------------------------------------------------------------
@@ -106,6 +107,42 @@ async function handle(request, { params }) {
     if (route === '/auth/login' && method === 'POST') {
       if (!body.email) return err('email required')
       const user = await ensureUser(db, String(body.email).toLowerCase().trim())
+      return json({ user: clean(user), entitlements: entitlementSnapshot(user.plan, user.used_task_units) })
+    }
+
+    // Passwordless with OTP step for operators/owners.
+    if (route === '/auth/request-code' && method === 'POST') {
+      if (!body.email) return err('email required')
+      const email = String(body.email).toLowerCase().trim()
+      const existing = await db.collection('users').findOne({ email })
+      const isOp = OPERATOR_EMAILS.includes(email) || email.includes('operator') || email.includes('founder') || existing?.role === 'owner'
+      const user = await ensureUser(db, email)
+      if (!isOp) {
+        return json({ otp_required: false, user: clean(user), entitlements: entitlementSnapshot(user.plan, user.used_task_units) })
+      }
+      const code = String(randomInt(0, 1000000)).padStart(6, '0')
+      await db.collection('otp_codes').updateOne(
+        { email },
+        { $set: { email, code_hash: hmac(`${email}:${code}`), expires_at: new Date(Date.now() + 10 * 60 * 1000), attempts: 0 } },
+        { upsert: true }
+      )
+      const sent = await sendOtpEmail(email, code)
+      await audit(db, { actor: email, action: 'auth.otp_requested', meta: { delivered: sent.delivered, dev: sent.dev } })
+      return json({ otp_required: true, delivery: sent.delivered ? 'email' : 'dev', dev_code: sent.delivered ? undefined : code })
+    }
+
+    if (route === '/auth/verify-code' && method === 'POST') {
+      const email = String(body.email || '').toLowerCase().trim()
+      const rec = await db.collection('otp_codes').findOne({ email })
+      if (!rec || rec.expires_at <= new Date()) return err('Code expired — please request a new one', 400)
+      if (rec.attempts >= 5) { await db.collection('otp_codes').deleteOne({ email }); return err('Too many attempts — request a new code', 429) }
+      if (rec.code_hash !== hmac(`${email}:${String(body.code || '')}`)) {
+        await db.collection('otp_codes').updateOne({ email }, { $inc: { attempts: 1 } })
+        return err('Invalid code', 401)
+      }
+      await db.collection('otp_codes').deleteOne({ email })
+      const user = await ensureUser(db, email)
+      await audit(db, { actor: email, action: 'auth.login_verified' })
       return json({ user: clean(user), entitlements: entitlementSnapshot(user.plan, user.used_task_units) })
     }
 

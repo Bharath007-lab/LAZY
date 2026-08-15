@@ -60,17 +60,33 @@ function Stat({ icon: Icon, label, value, sub, accent = 'text-emerald-400' }) {
 // ============================ LOGIN ============================
 function Login({ onLogin }) {
   const [email, setEmail] = useState('')
+  const [code, setCode] = useState('')
+  const [step, setStep] = useState('email') // email | code
+  const [devCode, setDevCode] = useState('')
   const [busy, setBusy] = useState(false)
-  const go = async (e) => {
+
+  const finish = (d) => { localStorage.setItem('lazy_uid', d.user.id); onLogin(d) }
+
+  const requestCode = async (e) => {
     e?.preventDefault()
     if (!email) return
     setBusy(true)
     try {
-      const d = await api('/auth/login', 'POST', { email })
-      localStorage.setItem('lazy_uid', d.user.id)
-      onLogin(d)
+      const d = await api('/auth/request-code', 'POST', { email })
+      if (!d.otp_required) { finish(d); return }
+      setStep('code'); setDevCode(d.dev_code || '')
+      if (d.delivery === 'email') toast.success('Verification code sent to your email')
+      else toast.message('Operator security: enter the code below', { description: 'Connect Resend in Integrations to receive it by email.' })
     } catch (e) { toast.error(e.message) } finally { setBusy(false) }
   }
+  const verify = async (e) => {
+    e?.preventDefault()
+    if (!code) return
+    setBusy(true)
+    try { finish(await api('/auth/verify-code', 'POST', { email, code })) }
+    catch (e) { toast.error(e.message) } finally { setBusy(false) }
+  }
+
   return (
     <div className="relative min-h-screen overflow-hidden">
       <div className="pointer-events-none absolute inset-0">
@@ -89,14 +105,28 @@ function Login({ onLogin }) {
         <p className="mt-6 max-w-xl text-center text-lg text-zinc-400">
           LAZY is your AI workforce. It observes, understands, plans, delegates, executes and verifies — so you just say what you want done.
         </p>
-        <form onSubmit={go} className="mt-10 flex w-full max-w-md flex-col gap-3">
-          <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@company.com" type="email"
-            className="h-12 border-white/10 bg-white/5 text-center text-base" />
-          <Button disabled={busy} className="h-12 bg-gradient-to-r from-emerald-400 to-teal-500 text-base font-medium text-black hover:opacity-90">
-            {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <>Enter your workforce <ArrowRight className="ml-1 h-4 w-4" /></>}
-          </Button>
-          <p className="text-center text-xs text-zinc-600">Passwordless demo. Use an email containing "founder" for Operator access.</p>
-        </form>
+
+        {step === 'email' ? (
+          <form onSubmit={requestCode} className="mt-10 flex w-full max-w-md flex-col gap-3">
+            <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@company.com" type="email"
+              className="h-12 border-white/10 bg-white/5 text-center text-base" />
+            <Button disabled={busy} className="h-12 bg-gradient-to-r from-emerald-400 to-teal-500 text-base font-medium text-black hover:opacity-90">
+              {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <>Enter your workforce <ArrowRight className="ml-1 h-4 w-4" /></>}
+            </Button>
+            <p className="text-center text-xs text-zinc-600">Passwordless. Operator emails get a security code. Use an email with "founder" for Operator access.</p>
+          </form>
+        ) : (
+          <form onSubmit={verify} className="mt-10 flex w-full max-w-md flex-col gap-3">
+            <div className="flex items-center justify-center gap-2 text-sm text-emerald-400"><ShieldCheck className="h-4 w-4" /> Operator verification for {email}</div>
+            <Input value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} placeholder="6-digit code" inputMode="numeric"
+              className="h-12 border-white/10 bg-white/5 text-center text-2xl tracking-[0.5em]" />
+            {devCode && <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-center text-xs text-amber-300">DEV MODE (no email provider connected) — your code is <b className="tracking-widest">{devCode}</b></div>}
+            <Button disabled={busy} className="h-12 bg-gradient-to-r from-emerald-400 to-teal-500 text-base font-medium text-black hover:opacity-90">
+              {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <>Verify & enter <ArrowRight className="ml-1 h-4 w-4" /></>}
+            </Button>
+            <button type="button" onClick={() => { setStep('email'); setCode(''); setDevCode('') }} className="text-center text-xs text-zinc-500 hover:text-zinc-300">← Use a different email</button>
+          </form>
+        )}
       </div>
     </div>
   )
