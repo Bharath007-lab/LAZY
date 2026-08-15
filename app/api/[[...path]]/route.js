@@ -47,9 +47,13 @@ async function audit(db, entry) {
   })
 }
 
+// Operator/owner allowlist. These emails always get Operator OS access.
+const OPERATOR_EMAILS = ['gbsreddy007@gmail.com']
+
 async function ensureUser(db, email) {
   let user = await db.collection('users').findOne({ email })
   if (!user) {
+    const isOperator = OPERATOR_EMAILS.includes(email) || email.includes('operator') || email.includes('founder')
     user = {
       id: randomUUID(),
       email,
@@ -57,7 +61,7 @@ async function ensureUser(db, email) {
       org_id: randomUUID(),
       plan: 'pro',
       used_task_units: 0,
-      role: email.includes('operator') || email.includes('founder') ? 'owner' : 'customer',
+      role: isOperator ? 'owner' : 'customer',
       createdAt: new Date(),
     }
     await db.collection('users').insertOne(user)
@@ -68,6 +72,9 @@ async function ensureUser(db, email) {
       })
     }
     await audit(db, { actor: email, action: 'user.signup', target: user.id })
+  } else if (OPERATOR_EMAILS.includes(email) && user.role !== 'owner') {
+    await db.collection('users').updateOne({ id: user.id }, { $set: { role: 'owner' } })
+    user.role = 'owner'
   }
   return user
 }
